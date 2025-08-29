@@ -11,10 +11,26 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import numpy as np
 import uuid
+import re
 
-# Embedding imports
-from sentence_transformers import SentenceTransformer
+# Enhanced embedding imports
+from sentence_transformers import SentenceTransformer, util
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+import spacy
+
+# Download required NLTK data
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
 
 # Load environment variables from .env.local if it exists
 if os.path.exists('.env.local'):
@@ -28,8 +44,11 @@ CSV_PATH = 'products.csv'
 RECOMMENDATION_COUNT = 50
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = "google/gemini-2.0-flash-exp:free"
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+
+# Enhanced embedding model for better semantic understanding
+EMBEDDING_MODEL_NAME = "all-mpnet-base-v2"  # Better than all-MiniLM-L6-v2
 EMBEDDINGS_CACHE_FILE = 'product_embeddings.pkl'
+PRODUCT_FEATURES_CACHE_FILE = 'product_features.pkl'
 
 app = FastAPI()
 app.add_middleware(
@@ -43,11 +62,14 @@ app.add_middleware(
 products_df = None
 product_embeddings = None
 embedding_model = None
+tfidf_vectorizer = None
+product_features = None
 
 # In-memory storage for user data (replace with database in production)
 wishlists = {}
 carts = {}
 user_profiles = {}
+recommendation_feedback = {}  # Store user feedback for model improvement
 
 class RecipientProfile(BaseModel):
     age: Optional[int] = None
@@ -58,12 +80,17 @@ class RecipientProfile(BaseModel):
     personality: List[str] = []
     lifestyle: List[str] = []
     preferences: List[str] = []
+    budget_preference: Optional[str] = None  # low, medium, high, luxury
+    tech_savviness: Optional[str] = None  # low, medium, high
+    style_preference: Optional[str] = None  # classic, modern, trendy, minimalist
 
 class OccasionInfo(BaseModel):
     occasion: str
     mood: Optional[str] = None
     formality: Optional[str] = None
     budget_range: Optional[Dict[str, float]] = None
+    urgency: Optional[str] = None  # immediate, planned, last_minute
+    group_size: Optional[int] = None  # individual, couple, family, group
 
 class FilterOptions(BaseModel):
     category: Optional[str] = None
@@ -73,7 +100,9 @@ class FilterOptions(BaseModel):
     handmade: Optional[bool] = None
     local: Optional[bool] = None
     rating_min: Optional[float] = None
-    sort_by: Optional[str] = None  # price, rating, popularity
+    sort_by: Optional[str] = None  # price, rating, popularity, relevance
+    exclude_categories: List[str] = []
+    include_brands: List[str] = []
 
 class PromptRequest(BaseModel):
     prompt: str
@@ -93,13 +122,162 @@ class ThankYouRequest(BaseModel):
     occasion: str
     message_style: str
 
-def get_product_text(row) -> str:
-    # Combine relevant fields for embedding
+class FeedbackRequest(BaseModel):
+    user_id: str
+    product_id: str
+    rating: int  # 1-5
+    feedback_type: str  # like, dislike, purchase, view
+    context: Optional[str] = None
+
+def preprocess_text(text: str) -> str:
+    """Enhanced text preprocessing for better embeddings"""
+    if pd.isna(text) or not text:
+        return ""
+    
+    # Convert to lowercase
+    text = str(text).lower()
+    
+    # Remove special characters but keep important ones
+    text = re.sub(r'[^\w\s\-\.]', ' ', text)
+    
+    # Remove extra whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
+def get_enhanced_product_text(row) -> str:
+    """Enhanced product text generation with better feature extraction"""
     fields = []
-    for col in ['name', 'main_category', 'sub_category', 'description']:
+    
+    # Primary fields with higher weight
+    primary_fields = ['name', 'main_category', 'sub_category', 'description']
+    for col in primary_fields:
         if col in row and pd.notnull(row[col]):
             fields.append(str(row[col]))
+    
+    # Secondary fields for context
+    secondary_fields = ['brand', 'color', 'material', 'size', 'style']
+    for col in secondary_fields:
+        if col in row and pd.notnull(row[col]):
+            fields.append(str(row[col]))
+    
+    # Price context
+    if 'actual_price' in row and pd.notnull(row['actual_price']):
+        try:
+            price = float(str(row['actual_price']).replace('₹', '').replace(',', ''))
+            if price < 500:
+                fields.append("budget friendly affordable")
+            elif price < 2000:
+                fields.append("mid range moderate price")
+            elif price < 5000:
+                fields.append("premium quality expensive")
+            else:
+                fields.append("luxury high end exclusive")
+        except:
+            pass
+    
+    # Rating context
+    if 'ratings' in row and pd.notnull(row['ratings']):
+        try:
+            rating = float(row['ratings'])
+            if rating >= 4.5:
+                fields.append("highly rated excellent quality")
+            elif rating >= 4.0:
+                fields.append("well rated good quality")
+            elif rating >= 3.5:
+                fields.append("decent rating average quality")
+        except:
+            pass
+    
     return ' | '.join(fields)
+
+def extract_product_features(products_df: pd.DataFrame) -> Dict[str, Any]:
+    """Extract comprehensive product features for better matching"""
+    features = {}
+    
+    for idx, row in products_df.iterrows():
+        product_id = str(idx)
+        features[product_id] = {
+            'categories': [],
+            'keywords': [],
+            'price_tier': 'unknown',
+            'rating_tier': 'unknown',
+            'age_appropriateness': 'all',
+            'gender_target': 'unisex',
+            'occasion_suitability': [],
+            'complexity': 'simple'
+        }
+        
+        # Extract categories
+        for col in ['main_category', 'sub_category']:
+            if col in row and pd.notnull(row[col]):
+                features[product_id]['categories'].append(str(row[col]).lower())
+        
+        # Extract keywords from name and description
+        text = get_enhanced_product_text(row)
+        words = word_tokenize(text.lower())
+        stop_words = set(stopwords.words('english'))
+        keywords = [word for word in words if word.isalnum() and word not in stop_words and len(word) > 2]
+        features[product_id]['keywords'] = list(set(keywords))
+        
+        # Price tier classification
+        if 'actual_price' in row and pd.notnull(row['actual_price']):
+            try:
+                price = float(str(row['actual_price']).replace('₹', '').replace(',', ''))
+                if price < 500:
+                    features[product_id]['price_tier'] = 'budget'
+                elif price < 2000:
+                    features[product_id]['price_tier'] = 'mid_range'
+                elif price < 5000:
+                    features[product_id]['price_tier'] = 'premium'
+                else:
+                    features[product_id]['price_tier'] = 'luxury'
+            except:
+                pass
+        
+        # Rating tier classification
+        if 'ratings' in row and pd.notnull(row['ratings']):
+            try:
+                rating = float(row['ratings'])
+                if rating >= 4.5:
+                    features[product_id]['rating_tier'] = 'excellent'
+                elif rating >= 4.0:
+                    features[product_id]['rating_tier'] = 'good'
+                elif rating >= 3.5:
+                    features[product_id]['rating_tier'] = 'average'
+                else:
+                    features[product_id]['rating_tier'] = 'poor'
+            except:
+                pass
+        
+        # Age appropriateness
+        text_lower = text.lower()
+        if any(word in text_lower for word in ['toy', 'kids', 'child', 'baby', 'toddler']):
+            features[product_id]['age_appropriateness'] = 'children'
+        elif any(word in text_lower for word in ['teen', 'adolescent', 'youth']):
+            features[product_id]['age_appropriateness'] = 'teen'
+        elif any(word in text_lower for word in ['adult', 'mature', 'professional']):
+            features[product_id]['age_appropriateness'] = 'adult'
+        
+        # Gender targeting
+        if any(word in text_lower for word in ['men', 'male', 'guy', 'boy']):
+            features[product_id]['gender_target'] = 'male'
+        elif any(word in text_lower for word in ['women', 'female', 'girl', 'lady']):
+            features[product_id]['gender_target'] = 'female'
+        
+        # Occasion suitability
+        occasions = []
+        if any(word in text_lower for word in ['birthday', 'party', 'celebration']):
+            occasions.append('birthday')
+        if any(word in text_lower for word in ['wedding', 'marriage', 'anniversary']):
+            occasions.append('wedding')
+        if any(word in text_lower for word in ['christmas', 'holiday', 'festival']):
+            occasions.append('holiday')
+        if any(word in text_lower for word in ['graduation', 'achievement', 'success']):
+            occasions.append('achievement')
+        features[product_id]['occasion_suitability'] = occasions
+    
+    return features
 
 def save_embeddings(embeddings, file_path):
     """Save embeddings to disk"""
@@ -121,6 +299,28 @@ def load_embeddings(file_path):
         return None
     except Exception as e:
         print(f"Error loading embeddings: {e}")
+        return None
+
+def save_features(features, file_path):
+    """Save product features to disk"""
+    try:
+        with open(file_path, 'wb') as f:
+            pickle.dump(features, f)
+        print(f"Product features saved to {file_path}")
+    except Exception as e:
+        print(f"Error saving features: {e}")
+
+def load_features(file_path):
+    """Load product features from disk"""
+    try:
+        if os.path.exists(file_path):
+            with open(file_path, 'rb') as f:
+                features = pickle.load(f)
+            print(f"Product features loaded from {file_path}")
+            return features
+        return None
+    except Exception as e:
+        print(f"Error loading features: {e}")
         return None
 
 def analyze_recipient_from_prompt(prompt: str) -> RecipientProfile:
@@ -171,7 +371,7 @@ def analyze_recipient_from_prompt(prompt: str) -> RecipientProfile:
 
 @app.on_event("startup")
 def load_products():
-    global products_df, product_embeddings, embedding_model
+    global products_df, product_embeddings, embedding_model, tfidf_vectorizer, product_features
     try:
         products_df = pd.read_csv(CSV_PATH, on_bad_lines='skip', low_memory=False, skiprows=3)
         if 'name' in products_df.columns:
@@ -194,7 +394,7 @@ def load_products():
         else:
             # Compute embeddings for all products
             print("Computing product embeddings...")
-            product_texts = [get_product_text(row) for _, row in products_df.iterrows()]
+            product_texts = [get_enhanced_product_text(row) for _, row in products_df.iterrows()]
             product_embeddings = embedding_model.encode(product_texts, show_progress_bar=True, batch_size=256)
             print(f"Computed embeddings for {len(product_embeddings)} products.")
             
@@ -202,14 +402,29 @@ def load_products():
             print("Saving embeddings to disk...")
             save_embeddings(product_embeddings, EMBEDDINGS_CACHE_FILE)
             
+        # Load TF-IDF vectorizer
+        print("Loading TF-IDF vectorizer...")
+        tfidf_vectorizer = TfidfVectorizer(max_features=10000, stop_words='english')
+        tfidf_vectorizer.fit(product_texts)
+        print("TF-IDF vectorizer loaded.")
+
+        # Load product features
+        print("Loading product features...")
+        product_features = extract_product_features(products_df)
+        save_features(product_features, PRODUCT_FEATURES_CACHE_FILE)
+        print("Product features loaded.")
+        
     except Exception as e:
         print(f"Error loading CSV or embeddings: {e}")
         products_df = pd.DataFrame()
         product_embeddings = None
         embedding_model = None
+        tfidf_vectorizer = None
+        product_features = None
 
 def find_top_products(prompt: str, recipient_profile: RecipientProfile, occasion_info: OccasionInfo, filter_options: FilterOptions, top_n: int = 100) -> List[int]:
-    global product_embeddings, embedding_model, products_df
+    """Enhanced product search with multiple ranking factors"""
+    global product_embeddings, embedding_model, products_df, tfidf_vectorizer, product_features
     if embedding_model is None or product_embeddings is None or products_df is None or products_df.empty:
         return []
     
@@ -221,12 +436,69 @@ def find_top_products(prompt: str, recipient_profile: RecipientProfile, occasion
         if occasion_info:
             enhanced_prompt += f" Occasion: {occasion_info.occasion} {occasion_info.mood}"
         
+        # Get semantic similarity scores
         prompt_emb = embedding_model.encode([enhanced_prompt])[0]
-        sims = cosine_similarity([prompt_emb], product_embeddings)[0]
+        semantic_sims = cosine_similarity([prompt_emb], product_embeddings)[0]
+        
+        # Get TF-IDF similarity scores
+        tfidf_sims = np.zeros(len(products_df))
+        if tfidf_vectorizer:
+            try:
+                prompt_tfidf = tfidf_vectorizer.transform([enhanced_prompt])
+                product_tfidf = tfidf_vectorizer.transform([get_enhanced_product_text(row) for _, row in products_df.iterrows()])
+                tfidf_sims = cosine_similarity(prompt_tfidf, product_tfidf)[0]
+            except:
+                pass
+        
+        # Calculate feature-based scores
+        feature_scores = np.zeros(len(products_df))
+        for i, (idx, row) in enumerate(products_df.iterrows()):
+            score = 0
+            product_id = str(idx)
+            
+            if product_features and product_id in product_features:
+                features = product_features[product_id]
+                
+                # Age appropriateness scoring
+                if recipient_profile.age:
+                    if recipient_profile.age < 13 and features['age_appropriateness'] == 'children':
+                        score += 0.3
+                    elif 13 <= recipient_profile.age < 18 and features['age_appropriateness'] == 'teen':
+                        score += 0.3
+                    elif recipient_profile.age >= 18 and features['age_appropriateness'] == 'adult':
+                        score += 0.3
+                
+                # Gender targeting scoring
+                if recipient_profile.gender and features['gender_target'] != 'unisex':
+                    if recipient_profile.gender.lower() in features['gender_target']:
+                        score += 0.2
+                
+                # Occasion suitability scoring
+                if occasion_info.occasion and occasion_info.occasion.lower() in features['occasion_suitability']:
+                    score += 0.4
+                
+                # Budget preference scoring
+                if recipient_profile.budget_preference and features['price_tier'] != 'unknown':
+                    budget_map = {'low': 'budget', 'medium': 'mid_range', 'high': 'premium', 'luxury': 'luxury'}
+                    if budget_map.get(recipient_profile.budget_preference) == features['price_tier']:
+                        score += 0.3
+                
+                # Rating preference scoring
+                if features['rating_tier'] in ['excellent', 'good']:
+                    score += 0.2
+            
+            feature_scores[i] = score
+        
+        # Combine all scores with weights
+        combined_scores = (
+            0.5 * semantic_sims +      # Semantic similarity (50% weight)
+            0.3 * tfidf_sims +         # TF-IDF similarity (30% weight)
+            0.2 * feature_scores       # Feature-based scoring (20% weight)
+        )
         
         # Apply filters
         filtered_indices = []
-        for i, sim in enumerate(sims):
+        for i, score in enumerate(combined_scores):
             if filter_options:
                 row = products_df.iloc[i]
                 # Price filter
@@ -255,14 +527,22 @@ def find_top_products(prompt: str, recipient_profile: RecipientProfile, occasion
                             continue
                     except:
                         pass
+                # Exclude categories
+                if filter_options.exclude_categories:
+                    if any(cat.lower() in str(row.get('main_category', '')).lower() for cat in filter_options.exclude_categories):
+                        continue
+                # Include brands
+                if filter_options.include_brands:
+                    if not any(brand.lower() in str(row.get('brand', '')).lower() for brand in filter_options.include_brands):
+                        continue
             filtered_indices.append(i)
         
-        # Sort by similarity and take top N
-        filtered_sims = [sims[i] for i in filtered_indices]
-        top_filtered_idx = np.argsort(filtered_sims)[::-1][:top_n]
+        # Sort by combined score and take top N
+        filtered_scores = [combined_scores[i] for i in filtered_indices]
+        top_filtered_idx = np.argsort(filtered_scores)[::-1][:top_n]
         return [filtered_indices[i] for i in top_filtered_idx]
     except Exception as e:
-        print(f"Embedding similarity error: {e}")
+        print(f"Enhanced product search error: {e}")
         return []
 
 def generate_greeting_card(recipient_name: str, occasion: str, message_style: str, personal_message: str = None) -> Dict[str, str]:
@@ -387,27 +667,46 @@ def recommend_products(req: PromptRequest):
         product_descriptions.append(desc)
     products_text = '\n'.join(product_descriptions)
 
-    # Enhanced system prompt with explainability
+    # Advanced system prompt with comprehensive analysis
     system_prompt = f"""
-    You are an expert gift recommendation AI. Given a user prompt and a list of products, select the {n} most suitable products for the user.
+    You are an expert gift recommendation AI with deep understanding of human psychology, relationships, and gift-giving etiquette. 
+    Your task is to analyze the user's request and provide highly personalized, thoughtful gift recommendations.
     
-    Recipient Profile:
-    - Age: {req.recipient_profile.age or 'Not specified'}
-    - Interests: {', '.join(req.recipient_profile.interests) or 'Not specified'}
-    - Hobbies: {', '.join(req.recipient_profile.hobbies) or 'Not specified'}
-    - Relationship: {req.recipient_profile.relationship or 'Not specified'}
-    - Personality: {', '.join(req.recipient_profile.personality) or 'Not specified'}
+    RECIPIENT ANALYSIS:
+    - Age: {req.recipient_profile.age or 'Not specified'} (Consider age-appropriate gifts)
+    - Gender: {req.recipient_profile.gender or 'Not specified'} (Respect preferences)
+    - Interests: {', '.join(req.recipient_profile.interests) or 'Not specified'} (Primary matching factor)
+    - Hobbies: {', '.join(req.recipient_profile.hobbies) or 'Not specified'} (Activity-based gifts)
+    - Relationship: {req.recipient_profile.relationship or 'Not specified'} (Formality level)
+    - Personality: {', '.join(req.recipient_profile.personality) or 'Not specified'} (Gift style)
+    - Budget Preference: {req.recipient_profile.budget_preference or 'Not specified'} (Price sensitivity)
+    - Tech Savviness: {req.recipient_profile.tech_savviness or 'Not specified'} (Technology comfort)
+    - Style Preference: {req.recipient_profile.style_preference or 'Not specified'} (Aesthetic taste)
     
-    Occasion: {req.occasion_info.occasion}
-    Mood: {req.occasion_info.mood or 'Not specified'}
+    OCCASION CONTEXT:
+    - Occasion: {req.occasion_info.occasion} (Cultural significance)
+    - Mood: {req.occasion_info.mood or 'Not specified'} (Emotional tone)
+    - Formality: {req.occasion_info.formality or 'Not specified'} (Event type)
+    - Urgency: {req.occasion_info.urgency or 'Not specified'} (Time sensitivity)
+    - Group Size: {req.occasion_info.group_size or 'Not specified'} (Social context)
     
-    For each recommendation, include:
-    1. Product name
-    2. Why this gift is perfect (explainability)
-    3. How it matches the recipient's profile
-    4. Why it fits the occasion
+    RECOMMENDATION CRITERIA:
+    1. PERSONALIZATION: How well does it match the recipient's unique characteristics?
+    2. OCCASION FIT: Is it appropriate for the specific occasion and mood?
+    3. RELATIONSHIP APPROPRIATENESS: Does it match the relationship dynamic?
+    4. PRACTICALITY: Will the recipient actually use/enjoy this gift?
+    5. MEMORABILITY: Will it create a lasting positive impression?
+    6. UNIQUENESS: Is it thoughtful and not generic?
     
-    Only recommend products from the provided list.
+    For each recommendation, provide:
+    - Product name and key details
+    - PERSONALIZATION REASONING: Why this specific gift matches this specific person
+    - OCCASION FIT: How it enhances the celebration/event
+    - RELATIONSHIP VALUE: How it strengthens the relationship
+    - PRACTICAL BENEFITS: What the recipient will gain from it
+    - PERSONALIZATION TIPS: How to make it even more special
+    
+    Focus on creating emotional connections and meaningful experiences, not just material items.
     """
     
     user_prompt = f"User prompt: {prompt}\n\nProduct list:\n{products_text}\n\nReturn a numbered list of the top {n} product recommendations with detailed explanations."
@@ -491,6 +790,17 @@ def add_to_cart(user_id: str, product_id: str, quantity: int = 1):
 @app.get("/cart/{user_id}")
 def get_cart(user_id: str):
     return {"cart": carts.get(user_id, {})}
+
+@app.post("/feedback")
+def submit_feedback(feedback: FeedbackRequest):
+    if feedback.user_id not in recommendation_feedback:
+        recommendation_feedback[feedback.user_id] = []
+    recommendation_feedback[feedback.user_id].append(feedback.dict())
+    return {"message": "Feedback submitted", "feedback_count": len(recommendation_feedback[feedback.user_id])}
+
+@app.get("/feedback/{user_id}")
+def get_user_feedback(user_id: str):
+    return {"feedback": recommendation_feedback.get(user_id, [])}
 
 @app.get("/health")
 def health_check():
