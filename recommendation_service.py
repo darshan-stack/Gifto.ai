@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import requests
 import json
+import pickle
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
@@ -28,6 +29,7 @@ RECOMMENDATION_COUNT = 50
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = "google/gemini-2.0-flash-exp:free"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+EMBEDDINGS_CACHE_FILE = 'product_embeddings.pkl'
 
 app = FastAPI()
 app.add_middleware(
@@ -99,6 +101,28 @@ def get_product_text(row) -> str:
             fields.append(str(row[col]))
     return ' | '.join(fields)
 
+def save_embeddings(embeddings, file_path):
+    """Save embeddings to disk"""
+    try:
+        with open(file_path, 'wb') as f:
+            pickle.dump(embeddings, f)
+        print(f"Embeddings saved to {file_path}")
+    except Exception as e:
+        print(f"Error saving embeddings: {e}")
+
+def load_embeddings(file_path):
+    """Load embeddings from disk"""
+    try:
+        if os.path.exists(file_path):
+            with open(file_path, 'rb') as f:
+                embeddings = pickle.load(f)
+            print(f"Embeddings loaded from {file_path}")
+            return embeddings
+        return None
+    except Exception as e:
+        print(f"Error loading embeddings: {e}")
+        return None
+
 def analyze_recipient_from_prompt(prompt: str) -> RecipientProfile:
     """Extract recipient information from prompt using AI"""
     try:
@@ -160,11 +184,24 @@ def load_products():
         print("Loading embedding model...")
         embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
         
-        # Compute embeddings for all products
-        print("Computing product embeddings...")
-        product_texts = [get_product_text(row) for _, row in products_df.iterrows()]
-        product_embeddings = embedding_model.encode(product_texts, show_progress_bar=True, batch_size=256)
-        print(f"Computed embeddings for {len(product_embeddings)} products.")
+        # Try to load embeddings from disk first
+        print("Checking for cached embeddings...")
+        cached_embeddings = load_embeddings(EMBEDDINGS_CACHE_FILE)
+        
+        if cached_embeddings is not None and len(cached_embeddings) == len(products_df):
+            print("Using cached embeddings!")
+            product_embeddings = cached_embeddings
+        else:
+            # Compute embeddings for all products
+            print("Computing product embeddings...")
+            product_texts = [get_product_text(row) for _, row in products_df.iterrows()]
+            product_embeddings = embedding_model.encode(product_texts, show_progress_bar=True, batch_size=256)
+            print(f"Computed embeddings for {len(product_embeddings)} products.")
+            
+            # Save embeddings to disk for future use
+            print("Saving embeddings to disk...")
+            save_embeddings(product_embeddings, EMBEDDINGS_CACHE_FILE)
+            
     except Exception as e:
         print(f"Error loading CSV or embeddings: {e}")
         products_df = pd.DataFrame()
